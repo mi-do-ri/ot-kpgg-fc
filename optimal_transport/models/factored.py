@@ -200,7 +200,7 @@ class KeypointFOT(_OT):
         loop = 1
         
         def cost(G0):
-            return self.f(G0) + (1.0 - self.alpha) * np.sum(mask * G * G0)
+            return f(G0) + (1.0 - self.alpha) * np.sum(mask * G * G0)
         
         def cost_mask(G0):
             return cost(mask * G0)
