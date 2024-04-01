@@ -63,13 +63,15 @@ class KeypointFOT(_OT):
             Gt = self._guide_matrix(z, xt, L, J)
             
             Ps = self._update_plans(Cs, Cz, a, h, Gs, Ms)
+            print("Ps: ", Ps)
             Pt = self._update_plans(Cz, Ct, h, b, Gt, Mt)
             z = self._update_anchors(xs, xt, Ps, Pt)
 
             err = np.linalg.norm(z - self.z_)
             self.z_ = z
+            print(z)
             if err <= self.stop_thr:
-                #print(f"Threshold reached at iteration {i}")
+                print(f"Threshold reached at iteration {i}")
                 break
         
         self.Pa_ = Ps
@@ -200,7 +202,7 @@ class KeypointFOT(_OT):
         loop = 1
         
         def cost(G0):
-            return f(G0) + (1.0 - self.alpha) * np.sum(mask * G * G0)
+            return self.alpha * f(G0) + (1.0 - self.alpha) * np.sum(mask * G * G0)
         
         def cost_mask(G0):
             return cost(mask * G0)
