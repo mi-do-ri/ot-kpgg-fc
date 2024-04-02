@@ -14,23 +14,27 @@ class KeypointFOT(_OT):
         distance: Distance = SquaredEuclidean,
         similarity: Distance = JSDiv,
         n_free_anchors: Optional[int] = None,
-        sinkhorn_reg: float = 0.004, 
+        sinkhorn_reg: float = 0.01, 
         temperature: float = 0.1, 
         div_term: float = 1e-10, 
-        guide_mixing: float = 0.5,
+        alpha: float = 0.5,
         stop_thr: float = 1e-5, 
-        max_iters: int = 100
+        max_iters: int = 100,
+        n_clusters: int = 3,
+        fused: bool = True
     ):
         super().__init__(distance)
         self.sim_fn = similarity
-
+        self.dist_fn = distance
         self.k = n_free_anchors
         self.eps = sinkhorn_reg
         self.rho = temperature
         self.div_term = div_term
         self.stop_thr = stop_thr
         self.max_iters = max_iters
-        self.alpha = 1 - guide_mixing
+        self.alpha = alpha
+        self.n_clusters = n_clusters
+        self.fused = fused
 
         self.Pa_: Optional[np.ndarray] = None
         self.Pb_: Optional[np.ndarray] = None
@@ -46,30 +50,32 @@ class KeypointFOT(_OT):
         K: List[Tuple],
         **kwargs,
     ) -> "KeypointFOT":
-        z, h = self._init_anchors(xs, self.k + len(K))
+        z, h = self._init_anchors(xs, self.n_clusters, self.k, len(K))
+        # print("inital z: ", z)
         I, L, J = self._init_keypoint_inds(K)
         Ms, Mt = self._init_masks(xs, z, xt, I, L, J)
 
         self.z_ = z
+        Cs = self.dist_fn(xs, xs)
+        Cs = Cs / (Cs.max() + self.div_term)
+        Ct = self.dist_fn(xt, xt)
+        Ct = Ct / (Ct.max() + self.div_term)
+        
         for i in range(self.max_iters):
-            Cs = self.dist_fn(xs, xs)
-            Cs = Cs / (Cs.max() + self.div_term)
-            Ct = self.dist_fn(xt, xt)
-            Ct = Ct / (Ct.max() + self.div_term)
             Cz = self.dist_fn(z, z)
             Cz = Cz / (Cz.max() + self.div_term)
             
-            Gs = self._guide_matrix(xs, z, I, L)
-            Gt = self._guide_matrix(z, xt, L, J)
+            Gs = self._guide_matrix(Cs, Cz, I, L)
+            Gt = self._guide_matrix(Cz, Ct, L, J)
             
             Ps = self._update_plans(Cs, Cz, a, h, Gs, Ms)
-            print("Ps: ", Ps)
             Pt = self._update_plans(Cz, Ct, h, b, Gt, Mt)
+            #print("Pt: ", Pt)
             z = self._update_anchors(xs, xt, Ps, Pt)
+            #print("z: ", z)
 
             err = np.linalg.norm(z - self.z_)
             self.z_ = z
-            print(z)
             if err <= self.stop_thr:
                 print(f"Threshold reached at iteration {i}")
                 break
@@ -105,12 +111,19 @@ class KeypointFOT(_OT):
     def _init_anchors(
         self, 
         x: np.ndarray,
-        n_clusters: int
+        n_clusters: int,
+        n_free_anchors: int,
+        n_keypoints: int
     ) -> Tuple[np.ndarray, np.ndarray]:
-        model = KMeans(n_clusters=n_clusters)
-        model.fit(x)
-        Z = model.cluster_centers_
-        h = np.ones(n_clusters) / (n_clusters)
+        T = (int)(n_keypoints + n_free_anchors) // n_clusters
+        Z = []
+        for i in range(T): 
+            model = KMeans(n_clusters=n_clusters)
+            model.fit(x)
+            z = model.cluster_centers_
+            Z.append(z)
+        Z = np.vstack(np.array(Z))
+        h = np.ones(len(Z)) / (len(Z))
         return Z, h
     
     def _init_masks(
@@ -137,10 +150,10 @@ class KeypointFOT(_OT):
         def hy(b):
             return (b * 2)
         
-        constCx = np.matmul(np.matmul(fx(Cx), p.reshape(-1, 1)),
+        constCx = np.dot(np.dot(fx(Cx), p.reshape(-1, 1)),
                             np.ones(len(q)).reshape(1, -1))
-        constCy = np.matmul(np.ones(len(p)).reshape(-1, 1),
-                            np.matmul(q.reshape(1, -1), fy(Cy).T))
+        constCy = np.dot(np.ones(len(p)).reshape(-1, 1),
+                            np.dot(q.reshape(1, -1), fy(Cy).T))
         constC = constCx + constCy
         hCx = hx(Cx)
         hCy = hy(Cy)
@@ -148,7 +161,7 @@ class KeypointFOT(_OT):
         return constC, hCx, hCy
     
     def _product(self, constC, hCx, hCy, T):
-        A = -np.matmul(np.matmul(hCx, T), hCy.T)
+        A = -np.dot(np.dot(hCx, T), (hCy.T))
         tens = constC + A
         return tens
     
@@ -202,24 +215,45 @@ class KeypointFOT(_OT):
         loop = 1
         
         def cost(G0):
-            return self.alpha * f(G0) + (1.0 - self.alpha) * np.sum(mask * G * G0)
+            if not self.fused:
+                return f(G0)
+            else:
+                return self.alpha * f(G0) + (1.0 - self.alpha) * np.sum(mask * G * G0)
         
         def cost_mask(G0):
             return cost(mask * G0)
         
-        f_val = cost_mask(G0)
+        if mask is None:
+            f_val = cost(G0)
+        else:
+            f_val = cost_mask(G0)
+            
         it = 0
+        
         while loop:
             it += 1
             old_fval = f_val
-            dfG = df(mask * G0)
-            M = self.alpha * dfG + (1.0 - self.alpha) * mask * G
+            
+            if mask is None:
+                dfG = df(G0)
+            else:
+                dfG = df(mask * G0)
+            
+            if self.fused: 
+                M = self.alpha * dfG + (1.0 - self.alpha) * mask * G
+            else:
+                M = dfG
+                
             M += M.min()
             
             Gc = self._sinkhorn_log_domain(p, q, M, mask)
             
             deltaG = Gc - G0
-            alpha1, f_val = self._solve_linesearch(cost, mask * G0, mask * deltaG, Cx, Cy, constC)
+            
+            if mask is None:
+                alpha1, f_val = self._solve_linesearch(cost, G0, deltaG, Cx, Cy, constC)
+            else:
+                alpha1, f_val = self._solve_linesearch(cost, mask*G0, mask*deltaG, Cx, Cy, constC)
             G0 += alpha1 * deltaG
             
             if it >= numItermax:
@@ -238,10 +272,10 @@ class KeypointFOT(_OT):
         Cx: np.array, Cy: np.ndarray, 
         constC: np.ndarray
     ):
-        dotx = np.matmul(Cx, deltaG)
-        dotxy = np.matmul(dotx, Cy)
+        dotx = np.dot(Cx, deltaG)
+        dotxy = np.dot(dotx, Cy)
         a = -2 * np.sum(dotxy * deltaG)
-        b = np.sum(constC * deltaG) - 2 * (np.sum(dotxy * G)) + np.sum(np.matmul(np.matmul(Cx, G), Cy) * deltaG)
+        b = np.sum(constC * deltaG) - 2 * (np.sum(dotxy * G) + np.sum(np.dot(np.dot(Cx, G), Cy) * deltaG))
         c = cost(G)
         
         alpha = self._solve_1d_linesearch_quad(a, b, c)
@@ -311,13 +345,9 @@ class KeypointFOT(_OT):
 
     def _guide_matrix(
         self,
-        xs: np.ndarray, xt: np.ndarray,
+        Cs: np.ndarray, Ct: np.ndarray,
         I: np.ndarray, J: np.ndarray,
     ) -> np.ndarray:
-        Cs = self.dist_fn(xs, xs)
-        Ct = self.dist_fn(xt, xt)
-        Cs = Cs / (Cs.max() + self.div_term)
-        Ct = Ct / (Ct.max() + self.div_term)
 
         Cs_kp = Cs[:, I]
         Ct_kp = Ct[:, J]
@@ -325,7 +355,6 @@ class KeypointFOT(_OT):
         R2 = softmax(-2 * Ct_kp / self.rho)
         G = self.sim_fn(R1, R2, eps=self.div_term)
         return G
-    
 
 class FOT(_OT):
     def __init__(
