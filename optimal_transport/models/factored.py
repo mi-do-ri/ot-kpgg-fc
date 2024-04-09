@@ -1,16 +1,18 @@
 from ._ot import _OT
 from ..utils import Distance, SquaredEuclidean, JSDiv, softmax
-
+from sklearn.metrics import pairwise_distances_argmin_min
 from typing import Optional, List, Tuple
 import numpy as np
 from numpy import linalg as LA
 from sklearn.cluster import KMeans
 import ot
-
+from scipy import stats
+from scipy.sparse import random
 
 class KeypointFOT(_OT):
     def __init__(
         self,
+        ys: np.ndarray,
         distance: Distance = SquaredEuclidean,
         similarity: Distance = JSDiv,
         n_free_anchors: Optional[int] = None,
@@ -24,6 +26,7 @@ class KeypointFOT(_OT):
         fused: bool = True
     ):
         super().__init__(distance)
+        self.ys = ys
         self.sim_fn = similarity
         self.dist_fn = distance
         self.k = n_free_anchors
@@ -50,9 +53,16 @@ class KeypointFOT(_OT):
         K: List[Tuple],
         **kwargs,
     ) -> "KeypointFOT":
-        z, h = self._init_anchors(xs, self.n_clusters, self.k, len(K))
-        # print("inital z: ", z)
-        I, L, J = self._init_keypoint_inds(K)
+        vs=xs.sum(axis=0) # set the weights on the features
+        vs/=vs.sum()
+        vt=xt.sum(axis=0)
+        vt/=vt.sum()
+        
+        # z, h = self._init_anchors(xs, self.n_clusters, self.k, len(K))
+        z, h, L = self._init_anchors(xs, self.ys, self.n_clusters, self.k, len(K))
+        print("inital z: ", z)
+        # I, L, J = self._init_keypoint_inds(K)
+        I, J = self._init_keypoint_inds(K)
         Ms, Mt = self._init_masks(xs, z, xt, I, L, J)
 
         self.z_ = z
@@ -60,7 +70,7 @@ class KeypointFOT(_OT):
         Cs = Cs / (Cs.max() + self.div_term)
         Ct = self.dist_fn(xt, xt)
         Ct = Ct / (Ct.max() + self.div_term)
-        
+         
         for i in range(self.max_iters):
             Cz = self.dist_fn(z, z)
             Cz = Cz / (Cz.max() + self.div_term)
@@ -70,16 +80,20 @@ class KeypointFOT(_OT):
             
             Ps = self._update_plans(Cs, Cz, a, h, Gs, Ms)
             Pt = self._update_plans(Cz, Ct, h, b, Gt, Mt)
-            #print("Pt: ", Pt)
-            z = self._update_anchors(xs, xt, Ps, Pt)
+            # P = Ps.dot(Pt)
+            # Pv = self._update_plan_feat(xs, xt, vs, vt, a, b, P)
+            Pv = np.ones((xs.shape[1], xt.shape[1])) / (xs.shape[1] * xt.shape[1])
+            print("Pv: ", Pv)
+            z = self._update_anchors(xs, xt, Ps, Pt, Pv)
             #print("z: ", z)
 
             err = np.linalg.norm(z - self.z_)
             self.z_ = z
+    
             if err <= self.stop_thr:
                 print(f"Threshold reached at iteration {i}")
                 break
-        
+        print(z)
         self.Pa_ = Ps
         self.Pb_ = Pt
         return self
@@ -105,26 +119,47 @@ class KeypointFOT(_OT):
     ) -> Tuple[np.ndarray]:
         I = np.array([pair[0] for pair in K])
         J = np.array([pair[1] for pair in K])
-        L = np.arange(len(K))
-        return I, L, J
+        # L = np.arange(len(K))
+        return I, J
 
     def _init_anchors(
         self, 
         x: np.ndarray,
+        y: np.ndarray,
         n_clusters: int,
         n_free_anchors: int,
         n_keypoints: int
     ) -> Tuple[np.ndarray, np.ndarray]:
         T = (int)(n_keypoints + n_free_anchors) // n_clusters
-        Z = []
-        for i in range(T): 
-            model = KMeans(n_clusters=n_clusters)
-            model.fit(x)
-            z = model.cluster_centers_
-            Z.append(z)
-        Z = np.vstack(np.array(Z))
+        # Z = []
+        # for i in range(T): 
+        #     model = KMeans(n_clusters=n_clusters)
+        #     model.fit(x)
+        #     z = model.cluster_centers_
+        #     Z.append(z)
+
+        unique_labels = np.unique(y)
+        selected_centers = []
+
+        for label in unique_labels:
+            # Lấy chỉ mục của các điểm thuộc class hiện tại
+            indices = np.where(y == label)[0]
+
+            # Tính trung bình của các điểm trong class
+            center = np.mean(x[indices], axis=0)
+
+            # Tính khoảng cách giữa mỗi điểm và trung tâm
+            distances = pairwise_distances_argmin_min(x[indices], [center])[1]
+
+            # Chọn 2 điểm có khoảng cách nhỏ nhất
+            selected_indices = indices[np.argsort(distances)[:T]]
+            selected_centers.extend(selected_indices)
+
+        Z = x[selected_centers]
+        L = [i * T + 1 for i in range(len(Z)//T)]
+        # Z = np.vstack(np.array(Z))
         h = np.ones(len(Z)) / (len(Z))
-        return Z, h
+        return Z, h, L
     
     def _init_masks(
         self,
@@ -154,11 +189,40 @@ class KeypointFOT(_OT):
                             np.ones(len(q)).reshape(1, -1))
         constCy = np.dot(np.ones(len(p)).reshape(-1, 1),
                             np.dot(q.reshape(1, -1), fy(Cy).T))
+        
         constC = constCx + constCy
         hCx = hx(Cx)
         hCy = hy(Cy)
         
         return constC, hCx, hCy
+    
+    def _init_matrix_feat(
+        self,
+        xs: np.ndarray, xt: np.ndarray,
+        vs: np.ndarray, vt: np.ndarray,
+    )-> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        def f1(a):
+            return (a ** 2)
+
+        def f2(b):
+            return (b ** 2)
+
+        def h1(a):
+            return a
+
+        def h2(b):
+            return 2 * b
+
+        constC1 = np.dot(np.dot(f1(xs), vs.reshape(-1, 1)),
+                        np.ones(f1(xt).shape[0]).reshape(1, -1))
+        constC2 = np.dot(np.ones(f1(xs).shape[0]).reshape(-1, 1),
+                        np.dot(vt.reshape(1, -1), f2(xt).T))
+
+        constC = constC1 + constC2
+        hX1 = h1(xs)
+        hX2 = h2(xt)
+
+        return constC, hX1, hX2
     
     def _product(self, constC, hCx, hCy, T):
         A = -np.dot(np.dot(hCx, T), (hCy.T))
@@ -176,11 +240,177 @@ class KeypointFOT(_OT):
         self, 
         xs: np.ndarray, xt: np.ndarray,
         Ps: np.ndarray, 
-        Pt: np.ndarray
+        Pt: np.ndarray,
+        Pv: np.ndarray
     ) -> np.ndarray:
         assert self.z_ is not None, "_init_anchors() did not run properly."
-        z = 0.5 * (np.matmul((Ps).T, xs) + np.matmul(Pt, xt)) * len(self.z_)
+        z = 0.5 * (np.matmul((Ps).T, xs) + np.matmul(np.matmul(Pt, xt), Pv.T)) * len(self.z_)
+        # z = 0.5 * (np.matmul((Ps).T, xs) + np.matmul(Pt, xt)) * len(self.z_)
         return z
+    
+    def _update_plan_feat(
+        self,
+        xs: np.ndarray, xt: np.ndarray,
+        vs: np.ndarray, vt: np.ndarray,
+        p: np.ndarray, q: np.ndarray,
+        P: np.ndarray,
+        random_init=False, log=False, verbose=False
+    ) -> np.array:
+        if vs is None:
+            vs = np.ones(xs.shape[1]) / xs.shape[1]
+        if vt is None:
+            vt = np.ones(xt.shape[1]) / xt.shape[1]
+        
+        if not random_init:
+            Pv = np.ones((xs.shape[1], xt.shape[1])) / (xs.shape[1] * xt.shape[1])  # is (d,d')
+        else:
+            Pv = self.random_gamma_init(vs,vt)
+        
+        constC, hC1, hC2 = self._init_matrix_feat(xs.T, xt.T, p, q)
+
+        cost = np.inf
+        log_out = {}
+        log_out['cost'] = []
+        n_iter = 1
+        cost_old = cost
+        
+        for i in range(n_iter):
+            Pv_old = Pv
+            M = constC - (hC1.dot(P)).dot(hC2.T)
+            M = M / (M.max() + self.div_term)
+            Pv = ot.sinkhorn(vs,vt, M, self.eps)
+            
+            delta = np.linalg.norm(Pv - Pv_old)
+            cost = np.sum(M * Pv)
+            
+            if log:
+                log_out['cost'].append(cost)
+                
+            if verbose:
+                print('Delta: {0}  Loss: {1}'.format(delta, cost))
+
+            if delta < 1e-16 or np.abs(cost_old - cost) < 1e-7:
+                if verbose:
+                    print('converged at iter ', i)
+                break
+            
+            cost_old = cost
+            # if log:
+            #     return Pv, log_out
+            # else:
+            #     return Pv
+        return Pv
+            
+        
+    def random_gamma_init(self,p,q, **kwargs):
+        """ Returns random coupling matrix with marginal p,q
+        """
+        rvs=stats.beta(1e-1,1e-1).rvs
+        S=random(len(p), len(q), density=1, data_rvs=rvs)
+        return self._sinkhorn_scaling(p,q,S.A, **kwargs)
+
+    def _sinkhorn_scaling(self,a,b,K,numItermax=1000, stopThr=1e-9, verbose=False,log=False,always_raise=False, **kwargs):
+        a = np.asarray(a, dtype=np.float64)
+        b = np.asarray(b, dtype=np.float64)
+        K = np.asarray(K, dtype=np.float64)
+
+        # init data
+        Nini = len(a)
+        Nfin = len(b)
+
+        if len(b.shape) > 1:
+            nbb = b.shape[1]
+        else:
+            nbb = 0
+
+        if log:
+            log = {'err': []}
+
+        # we assume that no distances are null except those of the diagonal of
+        # distances
+        if nbb:
+            u = np.ones((Nini, nbb)) / Nini
+            v = np.ones((Nfin, nbb)) / Nfin
+        else:
+            u = np.ones(Nini) / Nini
+            v = np.ones(Nfin) / Nfin
+
+        # print(reg)
+        # print(np.min(K))
+
+        Kp = (1 / a).reshape(-1, 1) * K
+        cpt = 0
+        err = 1
+        while (err > stopThr and cpt < numItermax):
+            uprev = u
+            vprev = v
+            KtransposeU = np.dot(K.T, u)
+            v = np.divide(b, KtransposeU)
+            u = 1. / np.dot(Kp, v)
+
+            zero_in_transp=np.any(KtransposeU == 0)
+            nan_in_dual= np.any(np.isnan(u)) or np.any(np.isnan(v))
+            inf_in_dual=np.any(np.isinf(u)) or np.any(np.isinf(v))
+            if zero_in_transp or nan_in_dual or inf_in_dual:
+                # we have reached the machine precision
+                # come back to previous solution and quit loop
+                print('Warning: numerical errors at iteration in sinkhorn_scaling', cpt)
+                #if zero_in_transp:
+                    #print('Zero in transp : ',KtransposeU)
+                #if nan_in_dual:
+                    #print('Nan in dual')
+                    #print('u : ',u)
+                    #print('v : ',v)
+                    #print('KtransposeU ',KtransposeU)
+                    #print('K ',K)
+                    #print('M ',M)
+
+                #    if always_raise:
+                #        raise NanInDualError
+                #if inf_in_dual:
+                #    print('Inf in dual')
+                u = uprev
+                v = vprev
+
+                break
+            if cpt % 10 == 0:
+                # we can speed up the process by checking for the error only all
+                # the 10th iterations
+                if nbb:
+                    err = np.sum((u - uprev)**2) / np.sum((u)**2) + \
+                        np.sum((v - vprev)**2) / np.sum((v)**2)
+                else:
+                    transp = u.reshape(-1, 1) * (K * v)
+                    err = np.linalg.norm((np.sum(transp, axis=0) - b))**2
+                if log:
+                    log['err'].append(err)
+
+                if verbose:
+                    if cpt % 200 == 0:
+                        print(
+                            '{:5s}|{:12s}'.format('It.', 'Err') + '\n' + '-' * 19)
+                    print('{:5d}|{:8e}|'.format(cpt, err))
+            cpt = cpt + 1
+        if log:
+            log['u'] = u
+            log['v'] = v
+
+        if nbb:  # return only loss
+            res = np.zeros((nbb))
+            for i in range(nbb):
+                res[i] = np.sum(
+                    u[:, i].reshape((-1, 1)) * K * v[:, i].reshape((1, -1)) * M)
+            if log:
+                return res, log
+            else:
+                return res
+
+        else:  # return OT matrix
+
+            if log:
+                return u.reshape((-1, 1)) * K * v.reshape((1, -1)), log
+            else:
+                return u.reshape((-1, 1)) * K * v.reshape((1, -1))
     
     def _update_plans(
         self,
@@ -199,7 +429,8 @@ class KeypointFOT(_OT):
         def df(G):
             return self._gwggrad(constC, hCx, hCy, G)
         
-        P = self._cg(p, q, Cx, Cy, constC, f, df, G0, mask, G)
+        P, f_val = self._cg(p, q, Cx, Cy, constC, f, df, G0, mask, G)
+        self.f_val = f_val
         
         return P
     
@@ -264,7 +495,7 @@ class KeypointFOT(_OT):
             if relative_delta_fval < self.stop_thr or abs_delta_fval < self.stop_thr:
                 loop = 0
         
-        return G0
+        return G0, f_val
     
     def _solve_linesearch(
         self,
